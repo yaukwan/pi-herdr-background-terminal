@@ -1,6 +1,12 @@
 # pi-herdr-background-terminal
 
-A Pi coding-agent extension that runs shell commands in persistent [Herdr](https://github.com/yaukwan/herdr) terminal panes and exposes their lifecycle through background-task tools.
+A Pi plugin that runs shell commands in persistent [Herdr](https://herdr.dev) terminal panes and exposes their lifecycle through background-task tools.
+
+## Install
+
+```bash
+pi install npm:pi-herdr-background-terminal
+```
 
 ## Features
 
