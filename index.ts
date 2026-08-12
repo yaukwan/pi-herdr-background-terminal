@@ -52,6 +52,7 @@ const DEFAULT_LIST_LIMIT = 25;
 const MAX_LIST_LIMIT = 100;
 const MAX_ACTIVE_TASKS = 64;
 const INTERRUPT_RECONCILE_MS = 1_000;
+const INTERRUPT_TRAP_GRACE_MS = 2_000;
 const INTERRUPT_POLL_MS = 50;
 const WATCH_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const WATCH_RETRY_MAX_MS = 30_000;
@@ -529,15 +530,24 @@ export class BackgroundTerminalService {
 
 	private async reconcileInterrupt(projectRoot: string, task: TaskRecord, signal?: AbortSignal): Promise<TaskRecord> {
 		const deadline = Date.now() + INTERRUPT_RECONCILE_MS;
+		let shellForegroundAt: number | undefined;
 		do {
 			if (isShellForeground(await this.client.paneProcessInfo(task.pane_id, signal))) {
+				if (shellForegroundAt === undefined) shellForegroundAt = Date.now();
+				// After Ctrl+C, the wrapper trap prints the DONE marker with code 130.
+				// Probe only once that marker has appeared; a premature read captures the
+				// echoed trap command text and leaks it into canonical output.
 				const captured = await this.probeTask(projectRoot, task.task_id, signal);
 				if (captured.status === "exited") return captured;
-				const exited = await this.updateTask(projectRoot, task.task_id, (current) => ({
-					...current, status: "exited", exit_code: 130, error: undefined, error_code: undefined, error_retryable: undefined,
-				}));
-				this.stopWatching(task.task_id);
-				return exited;
+				if (Date.now() - shellForegroundAt > INTERRUPT_TRAP_GRACE_MS) {
+					const exited = await this.updateTask(projectRoot, task.task_id, (current) => ({
+						...current, status: "exited", exit_code: 130, error: undefined, error_code: undefined, error_retryable: undefined,
+					}));
+					this.stopWatching(task.task_id);
+					return exited;
+				}
+			} else {
+				shellForegroundAt = undefined;
 			}
 			await delay(INTERRUPT_POLL_MS, undefined, { signal });
 		} while (Date.now() < deadline);

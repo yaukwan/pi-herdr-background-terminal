@@ -138,7 +138,7 @@ async function runServiceIntegration(): Promise<void> {
 					tokens.set(pane, token);
 					const pair = markers(token);
 					outputs.set(pane, input.includes("exit 7")
-						? `$ ( set +e\n); rc=$?\nprintf '\\n\n${pair.start}\nquick output\n${pair.done}:7\n$ `
+						? `$ ( set +e\n); rc=$?\nexit "$rc"\n${pair.start}\nquick output\n${pair.done}:7\n$ `
 						: `${pair.start}\nserver ready`);
 				} else if (Array.isArray(keys) && keys[0] === "ctrl+c") {
 					const pair = markers(tokens.get(pane) as string);

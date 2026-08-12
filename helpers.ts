@@ -27,7 +27,7 @@ export function markers(token: string): MarkerPair {
 
 export function wrapCommand(command: string, token: string): string {
 	const marker = markers(token);
-	return `(\n  set +e\n  printf '\\n${marker.start}\\n'\n  ${command}\n)\nrc=$?\nprintf '\\n${marker.done}:%s\\n' "$rc"`;
+	return `(\n  trap 'rc=130; printf "\\n${marker.done}:%s\\n" "$rc"; exit "$rc"' INT\n  set +e\n  printf '\\n${marker.start}\\n'\n  (\n    ${command}\n  )\n  rc=$?\n  printf '\\n${marker.done}:%s\\n' "$rc"\n  exit "$rc"\n)`;
 }
 
 export function parseTaskOutput(raw: string, token: string): ParsedTaskOutput {
@@ -44,6 +44,10 @@ export function parseTaskOutput(raw: string, token: string): ParsedTaskOutput {
 		if (/^-?\d+$/.test(code)) {
 			doneIndex = index;
 			exitCode = Number.parseInt(code, 10);
+		} else if (code === "") {
+			// Empty code: wrapper trap fired without a usable exit code (e.g. SIGINT
+			// before rc was captured). The DONE line still marks a terminal state.
+			doneIndex = index;
 		}
 	}
 	if (startIndex === -1) return { started: false, output: "", exitCode };

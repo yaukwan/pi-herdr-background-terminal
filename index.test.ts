@@ -53,8 +53,9 @@ test("dual marker wrapper separates task output from pane noise", () => {
 	expect(wrapped).toContain(pair.done);
 	const fixture = [
 		"$ ( set +e",
-		"); rc=$?",
-		"printf '\\n",
+		`); rc=$?`,
+		`exit "$rc"`,
+		`printf '\\n`,
 		pair.start,
 		"real output",
 		"second line",
@@ -63,13 +64,19 @@ test("dual marker wrapper separates task output from pane noise", () => {
 	].join("\n");
 	const parsed = parseTaskOutput(fixture, token);
 	expect(parsed).toEqual({ started: true, output: "real output\nsecond line", exitCode: 7 });
-	for (const leaked of ["( set +e", "); rc=$?", "__PI_BG_DONE_", "printf '\\n"]) expect(parsed.output).not.toContain(leaked);
+	for (const leaked of ["( set +e", "); rc=$?", "__PI_BG_DONE_", "printf '\\n", "exit \"$rc\""]) expect(parsed.output).not.toContain(leaked);
 });
 
 test("output is hidden until the exact start marker exists", () => {
 	const parsed = parseTaskOutput("prompt\nwrapper echo\n__PI_BG_nope_DONE__:0", "token");
 	expect(parsed.started).toBeFalse();
 	expect(parsed.output).toBe("");
+});
+
+test("empty DONE code marks a terminal state without an exit code", () => {
+	const pair = markers("token");
+	const parsed = parseTaskOutput(`${pair.start}\nready\n^C\n${pair.done}:`, "token");
+	expect(parsed).toEqual({ started: true, output: "ready\n^C", exitCode: undefined });
 });
 
 test("runtime payload and opaque-id bounds reject oversized values", () => {
