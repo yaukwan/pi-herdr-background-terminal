@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-background-terminal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Pi extension for running persistent background terminal tasks through Herdr.",
   "type": "module",
   "license": "MIT",
