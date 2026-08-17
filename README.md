@@ -12,6 +12,7 @@ pi install npm:pi-herdr-background-terminal
 
 - Start long-running commands without blocking the current session.
 - Inspect task state and bounded console output after Herdr or Pi restarts.
+- Automatically release panes and tabs after terminal output is archived.
 - Send PTY input to running tasks.
 - Interrupt or terminate tasks explicitly.
 - Persist task metadata and canonical output per project.
