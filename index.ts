@@ -14,7 +14,6 @@ import {
 	isPaneNotFound,
 	isPaneWaitTimeout,
 	isShellForeground,
-	isTabNotFound,
 	isWorkspaceNotFound,
 	textFromPaneRead,
 } from "./herdr-client.ts";
@@ -272,9 +271,10 @@ export class BackgroundTerminalService {
 			await this.client.paneSendKeys(record.pane_id, ["enter"], signal);
 		} catch (error) {
 			const info = errorInfo(error);
-			await this.updateTask(projectRoot, record.task_id, (current) => ({
+			const failed = await this.updateTask(projectRoot, record.task_id, (current) => ({
 				...current, status: "failed", error: info.message, error_code: info.code, error_retryable: info.retryable,
 			}));
+			this.watch(failed.task_id, projectRoot, ctx);
 			throw error;
 		}
 		this.watch(record.task_id, projectRoot, ctx);
@@ -348,9 +348,12 @@ export class BackgroundTerminalService {
 				const terminated = await this.updateTask(projectRoot, current.task_id, (record) => ({
 					...record, status: "terminated", exit_code: undefined, error: undefined, error_code: undefined, error_retryable: undefined,
 				}));
+				const released = await this.releaseTaskResources(projectRoot, terminated.task_id, signal);
 				this.stopWatching(current.task_id);
-				return { task: taskSummary(terminated), mode: "terminate", accepted: true };
+				return { task: taskSummary(released), mode: "terminate", accepted: true };
 			} catch (error) {
+				const latest = await this.getTask(projectRoot, current.task_id);
+				if (isTerminal(latest.status) && !latest.resources_released_at) this.watch(latest.task_id, projectRoot, ctx);
 				return this.controlError(projectRoot, current, params.mode, error);
 			}
 		});
@@ -363,38 +366,33 @@ export class BackgroundTerminalService {
 			const state = await loadProjectState(projectRoot, this.stateHome);
 			return { eligible: Object.values(state.tasks).filter((task) => isTerminal(task.status)).length, removed: 0 };
 		}
-		const snapshot = await withProjectLock(projectRoot, async (state) => {
-			const terminal = Object.values(state.tasks).filter((task) => isTerminal(task.status));
-			const closableTabs = new Set(terminal
-				.filter((task) => !Object.values(state.tasks).some((other) => other.tab_id === task.tab_id && !isTerminal(other.status)))
-				.map((task) => task.tab_id));
-			return { state, value: { terminal, closableTabs } };
+		const terminal = await withProjectLock(projectRoot, async (state) => {
+			return { state, value: Object.values(state.tasks).filter((task) => isTerminal(task.status)) };
 		}, this.stateHome);
 
 		if (this.client.enabled) {
-			for (const task of snapshot.terminal) {
-				try { await this.client.paneClose(task.pane_id); } catch (error) { if (!isPaneNotFound(error)) throw error; }
-			}
-			for (const tabId of snapshot.closableTabs) {
-				try { await this.client.tabClose(tabId); } catch (error) { if (!isTabNotFound(error)) throw error; }
+			for (const task of terminal) {
+				await this.withTaskInteraction(task.task_id, undefined, () => this.releaseTaskResources(projectRoot, task.task_id));
 			}
 		}
 
 		const removed = await withProjectLock(projectRoot, async (state) => {
-			const ids = snapshot.terminal.map((task) => task.task_id).filter((id) => state.tasks[id] && isTerminal(state.tasks[id].status));
+			const ids = terminal.map((task) => task.task_id).filter((id) => state.tasks[id] && isTerminal(state.tasks[id].status));
 			for (const id of ids) delete state.tasks[id];
 			return { state, value: ids };
 		}, this.stateHome);
 		await Promise.all(removed.map((id) => removeTaskOutput(projectRoot, id, this.stateHome)));
-		return { eligible: snapshot.terminal.length, removed: removed.length };
+		return { eligible: terminal.length, removed: removed.length };
 	}
 
 	async focus(id: string, ctx: ExtensionContext): Promise<void> {
 		assertProjectTrusted(ctx);
 		assertTaskId(id);
-		await this.ensureAvailable();
 		const { projectRoot } = await this.projectPaths(ctx);
-		await this.client.paneFocus((await this.getTask(projectRoot, id)).pane_id);
+		const task = await this.getTask(projectRoot, id);
+		if (task.resources_released_at) throw new Error(`task_archived: Background task ${id} has released its terminal. Use background_read.`);
+		await this.ensureAvailable();
+		await this.client.paneFocus(task.pane_id);
 	}
 
 	async recover(ctx: ExtensionContext): Promise<void> {
@@ -403,14 +401,21 @@ export class BackgroundTerminalService {
 		try { await this.ensureAvailable(); } catch { return; }
 		const state = await loadProjectState(projectRoot, this.stateHome);
 		for (const task of Object.values(state.tasks)) {
-			if (isTerminal(task.status)) continue;
+			if (isTerminal(task.status)) {
+				if (!task.resources_released_at) this.watch(task.task_id, projectRoot, ctx);
+				continue;
+			}
 			void this.withTaskInteraction(task.task_id, undefined, async () => {
 				const current = await this.probeTask(projectRoot, task.task_id);
-				if (isTerminal(current.status)) return;
+				if (isTerminal(current.status)) {
+					this.watch(current.task_id, projectRoot, ctx);
+					return;
+				}
 				if (current.status === "starting") {
 					try {
 						if (isShellForeground(await this.client.paneProcessInfo(current.pane_id))) {
-							await this.failTask(projectRoot, current.task_id, "launch_incomplete", "Background task did not reach its start marker");
+							const failed = await this.failTask(projectRoot, current.task_id, "launch_incomplete", "Background task did not reach its start marker");
+							this.watch(failed.task_id, projectRoot, ctx);
 							return;
 						}
 					} catch (error) {
@@ -438,6 +443,22 @@ export class BackgroundTerminalService {
 			const next = { ...update(current), updated_at: new Date().toISOString() };
 			state.tasks[id] = next;
 			return { state, value: next };
+		}, this.stateHome);
+	}
+
+	private async releaseTaskResources(projectRoot: string, id: string, signal?: AbortSignal): Promise<TaskRecord> {
+		const task = await this.getTask(projectRoot, id);
+		if (!isTerminal(task.status) || task.resources_released_at) return task;
+		try { await this.client.paneClose(task.pane_id, signal); } catch (error) { if (!isPaneNotFound(error)) throw error; }
+		try { await this.client.tabClose(task.tab_id, signal); } catch (error) { if (!isPaneNotFound(error)) throw error; }
+		return withProjectLock(projectRoot, async (state) => {
+			const current = state.tasks[id];
+			if (!current || !isTerminal(current.status) || current.resources_released_at) {
+				return { state, value: current ?? task };
+			}
+			const released = { ...current, resources_released_at: new Date().toISOString() };
+			state.tasks[id] = released;
+			return { state, value: released };
 		}, this.stateHome);
 	}
 
@@ -538,13 +559,13 @@ export class BackgroundTerminalService {
 				// Probe only once that marker has appeared; a premature read captures the
 				// echoed trap command text and leaks it into canonical output.
 				const captured = await this.probeTask(projectRoot, task.task_id, signal);
-				if (captured.status === "exited") return captured;
+				if (captured.status === "exited") return this.releaseTaskResources(projectRoot, captured.task_id, signal);
 				if (Date.now() - shellForegroundAt > INTERRUPT_TRAP_GRACE_MS) {
 					const exited = await this.updateTask(projectRoot, task.task_id, (current) => ({
 						...current, status: "exited", exit_code: 130, error: undefined, error_code: undefined, error_retryable: undefined,
 					}));
 					this.stopWatching(task.task_id);
-					return exited;
+					return this.releaseTaskResources(projectRoot, exited.task_id, signal);
 				}
 			} else {
 				shellForegroundAt = undefined;
@@ -580,10 +601,16 @@ export class BackgroundTerminalService {
 			let retryMs = 1_000;
 			while (!controller.signal.aborted) {
 				const task = await this.getTask(projectRoot, id);
-				if (isTerminal(task.status)) return;
 				try {
+					if (isTerminal(task.status)) {
+						await this.withTaskInteraction(id, controller.signal, () => this.releaseTaskResources(projectRoot, id, controller.signal));
+						return;
+					}
 					await this.client.paneWaitForOutput(task.pane_id, completionMarker(task.marker), WATCH_TIMEOUT_MS, controller.signal);
-					const updated = await this.withTaskInteraction(id, controller.signal, () => this.probeTask(projectRoot, id, controller.signal));
+					const updated = await this.withTaskInteraction(id, controller.signal, async () => {
+						const current = await this.probeTask(projectRoot, id, controller.signal);
+						return isTerminal(current.status) ? this.releaseTaskResources(projectRoot, id, controller.signal) : current;
+					});
 					if (!isTerminal(updated.status)) continue;
 					if (ctx.hasUI) ctx.ui.notify(`${updated.name} exited${updated.exit_code === undefined ? "" : ` with ${updated.exit_code}`}`, updated.exit_code === 0 ? "info" : "warning");
 					return;

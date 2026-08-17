@@ -84,6 +84,7 @@ async function runTerminateWatcherRaceRegression(): Promise<void> {
 				throw new HerdrRequestError({ kind: "remote", method: "pane.read", code: "pane_not_found", retryable: false }, "pane closed");
 			},
 			paneClose: async () => ({}),
+			tabClose: async () => ({}),
 		} as unknown as HerdrClient;
 		const watcherService = new BackgroundTerminalService(client, home);
 		const controlService = new BackgroundTerminalService(client, home);
@@ -107,6 +108,8 @@ async function runServiceIntegration(): Promise<void> {
 	const pendingInputs = new Map<string, string>();
 	const outputs = new Map<string, string>();
 	const tokens = new Map<string, string>();
+	const closedPanes = new Set<string>();
+	const closedTabs = new Set<string>();
 	const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 	let nextPane = 1;
 	await mkdir(projectPath, { recursive: true });
@@ -153,8 +156,12 @@ async function runServiceIntegration(): Promise<void> {
 			}
 			case "pane.read": return { type: "pane_read", read: { pane_id: String(params.pane_id), text: outputs.get(String(params.pane_id)) ?? "" } };
 			case "pane.process_info": return { type: "pane_process_info", process_info: { pane_id: String(params.pane_id), shell_pid: 100, foreground_process_group_id: 100 } };
-			case "pane.close": return { closed: true };
-			case "tab.close": return { closed: true };
+			case "pane.close":
+				closedPanes.add(String(params.pane_id));
+				return { closed: true };
+			case "tab.close":
+				closedTabs.add(String(params.tab_id));
+				return { closed: true };
 			default: throw new Error(`Unexpected Herdr method: ${String(request.method)}`);
 		}
 	});
@@ -163,25 +170,35 @@ async function runServiceIntegration(): Promise<void> {
 	try {
 		const quick = await service.exec({ command: "echo quick; exit 7", label: "quick command" }, context);
 		assert.match(quick.task_id, /^bt_/);
-		await waitUntil(async () => (await loadProjectState(projectRoot, home)).tasks[quick.task_id]?.status === "exited");
+		await waitUntil(async () => Boolean((await loadProjectState(projectRoot, home)).tasks[quick.task_id]?.resources_released_at));
+		const quickRecord = (await loadProjectState(projectRoot, home)).tasks[quick.task_id] as TaskRecord;
+		assert.equal(quickRecord.status, "exited");
+		assert.equal(closedPanes.has(quickRecord.pane_id), true);
+		assert.equal(closedTabs.has(quickRecord.tab_id), true);
 		const quickRead = await service.read({ task_id: quick.task_id, wait_ms: 0 }, context);
 		assert.equal(quickRead, "quick output");
+		await assert.rejects(() => service.focus(quick.task_id, context), /task_archived: .* Use background_read\./);
 		assert.equal((await service.list({ task_id: quick.task_id }, context)).tasks[0]?.exit_code, 7);
 		for (const leaked of ["( set +e", "); rc=$?", "printf '\\n", "__PI_BG_"]) assert.equal(quickRead.includes(leaked), false);
 
 		const active = await service.exec({ command: "sleep 30", label: "interactive" }, context);
 		const activeRead = await service.read({ task_id: active.task_id, wait_ms: 0 }, context);
 		assert.equal(activeRead, "server ready");
-		assert.equal((await service.list({ task_id: active.task_id }, context)).tasks[0]?.state, "running");
+		const activeRecord = (await loadProjectState(projectRoot, home)).tasks[active.task_id] as TaskRecord;
+		assert.equal(activeRecord.status, "running");
+		assert.equal(closedPanes.has(activeRecord.pane_id), false);
 		await service.write({ task_id: active.task_id, input: "continue" }, context);
 		assert.equal(requests.some((request) => request.method === "pane.send_input" && request.params.text === "continue"), true);
 		const interrupted = await service.stop({ task_id: active.task_id, mode: "interrupt" }, context);
 		assert.equal(interrupted.task.state, "exited");
 		assert.equal(interrupted.task.exit_code, 130);
+		assert.equal(closedPanes.has(activeRecord.pane_id), true);
+		assert.equal(closedTabs.has(activeRecord.tab_id), true);
 
 		const terminable = await service.exec({ command: "sleep 30", label: "terminable" }, context);
 		const terminated = await service.stop({ task_id: terminable.task_id, mode: "terminate" }, context);
 		assert.equal(terminated.task.state, "terminated");
+		assert.ok((await loadProjectState(projectRoot, home)).tasks[terminable.task_id]?.resources_released_at);
 		await assert.rejects(
 			() => service.write({ task_id: terminable.task_id, input: "nope" }, context),
 			/task_not_running: Background task .* is terminated\. Use background_read to inspect it or background_exec to start a new task\./,
@@ -195,13 +212,22 @@ async function runServiceIntegration(): Promise<void> {
 			tasks: { crash: startingTask("crash", "crash-pane", projectRoot, crashToken) },
 		}, home);
 		await service.recover(context);
-		await waitUntil(async () => (await loadProjectState(projectRoot, home)).tasks.crash?.status === "exited");
+		await waitUntil(async () => Boolean((await loadProjectState(projectRoot, home)).tasks.crash?.resources_released_at));
 
 		const offline = new BackgroundTerminalService({ enabled: false } as HerdrClient, home);
 		const listed = await offline.list({ task_id: "crash" }, context);
 		assert.equal(listed.tasks[0]?.state, "exited");
 		const offlineRead = await offline.read({ task_id: "crash" }, context);
 		assert.equal(offlineRead, "recovered");
+
+		await saveProjectState({
+			version: STATE_VERSION, project_root: projectRoot,
+			tasks: { archived: { ...startingTask("archived", "archived-pane", projectRoot, "archivedtoken"), status: "exited", exit_code: 0 } },
+		}, home);
+		await service.recover(context);
+		await waitUntil(async () => Boolean((await loadProjectState(projectRoot, home)).tasks.archived?.resources_released_at));
+		assert.equal(closedPanes.has("archived-pane"), true);
+		assert.equal(closedTabs.has("tab-archived"), true);
 
 		const closeStarted = deferred<void>();
 		const closeRelease = deferred<void>();
@@ -211,6 +237,10 @@ async function runServiceIntegration(): Promise<void> {
 			tabClose: async () => ({}),
 		} as unknown as HerdrClient;
 		const slowService = new BackgroundTerminalService(slowClient, home);
+		await saveProjectState({
+			version: STATE_VERSION, project_root: projectRoot,
+			tasks: { cleanup: { ...startingTask("cleanup", "cleanup-pane", projectRoot, "cleanuptoken"), status: "exited", exit_code: 0 } },
+		}, home);
 		const cleaning = slowService.cleanup(context, true);
 		await closeStarted.promise;
 		await saveProjectState({ version: STATE_VERSION, project_root: projectRoot, tasks: { concurrent: { ...startingTask("concurrent", "p-concurrent", projectRoot, "token"), status: "running" } } }, home);

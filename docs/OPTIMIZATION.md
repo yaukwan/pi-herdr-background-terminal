@@ -120,13 +120,15 @@ __PI_BG_<token>_DONE__:<exit-code>
 
 恢复时：
 
-1. 终态任务不会访问 Herdr。
+1. 已释放资源的终态任务不会访问 Herdr；旧的未释放终态任务会补偿关闭 pane/tab。
 2. `starting` 任务发现 done marker 后归档为 `exited`，发现 start marker 后转为 `running`。
 3. pane 不存在时转为 `orphaned`。
 4. shell 已回到前台但没有 start marker 时转为 `failed`，错误码为 `launch_incomplete`。
 5. foreground 仍有进程时重新挂载 watcher。
 
 同一任务的 read/write/stop/watcher 在进程内串行；不同任务仍可并行。终态状态是吸收态：迟到 watcher 或其他服务实例的 pane-not-found 事件不会把 `exited`、`terminated`、`failed` 或 `orphaned` 覆盖为另一状态。watcher 的非重试错误会写入结构化 `failed` 状态，不会静默丢失监控责任。
+
+任务进入终态并成功保存 canonical output 后，扩展自动关闭对应 pane 和 tab，再写入内部 `resources_released_at` 标记。关闭操作将 pane/tab/workspace not-found 视为幂等成功；其他错误由 watcher 重试，或在下次 session 恢复时补偿。任务元数据和归档输出继续保留，因此终态 `background_list` 和 `background_read` 不依赖 Herdr 资源。`/bg focus` 对已释放资源的任务返回 `task_archived` 导航错误。
 
 ## 4. 状态、安全与清理
 
@@ -144,11 +146,11 @@ __PI_BG_<token>_DONE__:<exit-code>
 
 所有公共工具、`/bg focus` 和 `/bg clean --confirm` 都先执行项目可信校验。task ID、cursor、cwd、command 和 input 均有运行时边界；task ID 作为不透明值处理，不参与路径推导。
 
-项目锁只保护本地状态。Herdr 网络调用不在 `withProjectLock()` 内执行。`/bg clean --confirm` 的顺序是：短锁读取终态快照，锁外关闭其资源，短锁确认并删除仍为终态的记录，锁外删除输出文件。共享 tab 仅在没有活动任务引用时关闭。
+项目锁只保护本地状态。Herdr 网络调用不在 `withProjectLock()` 内执行。`/bg clean --confirm` 的顺序是：短锁读取终态快照，锁外补偿释放尚未关闭的资源，短锁确认并删除仍为终态的记录，锁外删除输出文件。日常 pane/tab 回收由终态归档流程自动完成，clean 主要用于删除历史。
 
 陈旧锁超过 30 秒后还会检查 owner PID；存活 PID 的锁不会仅因 mtime 被删除。
 
-`/bg clean --confirm` 只删除扩展状态和输出文件，不删除 Pi session 历史，也不会终止运行任务。
+`/bg clean --confirm` 删除扩展状态和输出文件，不删除 Pi session 历史，也不会终止运行任务。
 
 ## 5. 验证
 
@@ -157,6 +159,6 @@ bun test index.test.ts
 bun service.integration.ts
 ```
 
-测试覆盖五工具注册、运行时输入边界、双 marker 输出裁剪、逐任务状态校验、相对 cwd、项目锁、快速非零退出、交互输入、中断、终止、terminate 与迟到 watcher 的跨服务竞态、starting 恢复、终态离线 list/read、终态 write 拒绝和 cleanup 与并发状态更新。
+测试覆盖五工具注册、运行时输入边界、双 marker 输出裁剪、逐任务状态校验、相对 cwd、项目锁、快速非零退出、终态 pane/tab 自动释放、交互输入、中断、终止、terminate 与迟到 watcher 的跨服务竞态、starting 恢复、终态资源补偿回收、终态离线 list/read、终态 write 拒绝和 cleanup 与并发状态更新。
 
 不实现 SQLite、无界日志、假增量 cursor、token 输出预算、CPU/RSS/PID 统计、模型可调用 bulk clean 或旧 `background_process` 兼容层。

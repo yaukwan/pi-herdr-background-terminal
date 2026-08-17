@@ -23,6 +23,7 @@ export interface TaskRecord {
 	error_code?: string;
 	error_retryable?: boolean;
 	output_truncated?: boolean;
+	resources_released_at?: string;
 }
 
 export interface ProjectState {
@@ -101,7 +102,8 @@ export function isTaskRecord(value: unknown): value is TaskRecord {
 		&& isOptionalString(task.error)
 		&& isOptionalString(task.error_code)
 		&& (task.error_retryable === undefined || typeof task.error_retryable === "boolean")
-		&& (task.output_truncated === undefined || typeof task.output_truncated === "boolean");
+		&& (task.output_truncated === undefined || typeof task.output_truncated === "boolean")
+		&& isOptionalString(task.resources_released_at);
 }
 
 function validateTasks(tasks: unknown): asserts tasks is Record<string, TaskRecord> {
